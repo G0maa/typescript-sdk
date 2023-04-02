@@ -11,11 +11,13 @@ import { getExecutionContext } from "../../src/context";
 import { MODE_OFF, MODE_RECORD, MODE_TEST } from "../../src/mode";
 import { HTTP, V1_BETA2 } from "../../src/keploy";
 import { putMocks } from "../../mock/utils";
-import { stringToBinary } from "../../src/util";
+import { ProcessDep, stringToBinary } from "../../src/util";
 import { DataBytes } from "../../proto/services/DataBytes";
 import { MockIds } from "../../mock/mock";
 import { Mock } from "../../proto/services/Mock";
 import { StrArr } from "../../proto/services/StrArr";
+import { getReasonPhrase } from "http-status-codes";
+import stream, { Readable } from "stream";
 
 // This is a prototype for GSoC, requested by Neha.
 // Generally I kept the original inegration from node-fetch
@@ -71,28 +73,69 @@ interceptor.on("request", (request, requestId) => {
   console.log("ctx.mode at .on('request')", ctx.mode);
 
   // to-do: name the interceptor based on the request
-  // const meta = {
-  //   name: "node-fetch",
-  //   url: request.url,
-  //   // options: options,
-  //   type: "HTTP_CLIENT",
-  // };
+  const meta = {
+    name: "node-fetch",
+    url: request.url,
+    // options: options,
+    type: "HTTP_CLIENT",
+  };
 
   switch (ctx.mode) {
     case MODE_TEST:
-      // to-do, dummy response for now.
+      const outputs = new Array(2);
+      if (
+        ctx.mocks != undefined &&
+        ctx.mocks.length > 0 &&
+        ctx.mocks[0].Kind == HTTP
+      ) {
+        const header: { [key: string]: string[] } = {};
+        for (const k in ctx.mocks[0].Spec?.Res?.Header) {
+          header[k] = ctx.mocks[0].Spec?.Res?.Header[k]?.Value;
+        }
+        outputs[1] = {
+          headers: getHeadersInit(header),
+          status: ctx.mocks[0].Spec.Res.StatusCode,
+          statusText: getReasonPhrase(ctx.mocks[0].Spec.Res.StatusCode),
+        };
+        outputs[0] = [ctx.mocks[0].Spec.Res.Body];
+        if (ctx?.fileExport) {
+          console.log(
+            "🤡 Returned the mocked outputs for Http dependency call with meta: ",
+            meta
+          );
+        }
+        ctx.mocks.shift();
+      } else {
+        ProcessDep({}, outputs);
+      }
+      const rinit: ResponseInit = {};
+
+      rinit.headers = new Headers(outputs[1].headers);
+      rinit.status = outputs[1].status;
+      rinit.statusText = outputs[1].statusText;
+      const buf: Buffer[] = [];
+      outputs[0].map((el: any) => {
+        buf.push(Buffer.from(el));
+      });
+      // const resp = new Response(Readable.from(buf), rinit);
+
+      // This doesnt work, problem with rinit.headers
+      const resp = new Response(Buffer.concat(buf), rinit);
+      request.respondWith(resp);
+
+      // This is the only way I could get it to work.
       // request.respondWith(
       //   new Response(
       //     JSON.stringify({
       //       firstName: "John",
       //       lastName: "Maverick",
       //     }),
-      //     {
-      //       status: 201,
-      //       statusText: "Created",
-      //       headers: {
-      //         "Content-Type": "application/json",
-      //       },
+      // {
+      // status: 201,
+      // statusText: "Created",
+      // headers: {
+      //   "Content-Type": "application/json",
+      // },
       //     }
       //   )
       // );
@@ -139,6 +182,7 @@ interceptor.on("response", async (response, request) => {
   switch (ctx.mode) {
     case MODE_TEST:
       // This is dealt with on .on("request")
+      console.log("mocks get here too");
       break;
     case MODE_RECORD:
       // Unsure if I need to clone
