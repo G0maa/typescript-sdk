@@ -4,7 +4,7 @@ import { BatchInterceptor } from "@mswjs/interceptors";
 import { ClientRequestInterceptor } from "@mswjs/interceptors/ClientRequest";
 import { XMLHttpRequestInterceptor } from "@mswjs/interceptors/XMLHttpRequest";
 import { FetchInterceptor } from "@mswjs/interceptors/fetch";
-// import { Buffer } from "node:buffer";
+import { getReasonPhrase } from "http-status-codes";
 
 // core Keploy functions
 import { getExecutionContext } from "../../src/context";
@@ -16,11 +16,16 @@ import { DataBytes } from "../../proto/services/DataBytes";
 import { MockIds } from "../../mock/mock";
 import { Mock } from "../../proto/services/Mock";
 import { StrArr } from "../../proto/services/StrArr";
-import { getReasonPhrase } from "http-status-codes";
-import stream, { Readable } from "stream";
+import { getResponseHeader } from "../express/middleware";
 
-// This is a prototype for GSoC, requested by Neha.
+// This is a prototype for GSoC, "indirectly" recommended by Neha.
 // Generally I kept the original inegration from node-fetch
+// Stuck with:
+// 1. streamToString results in weird characters
+// 2. I get "Keploy context is not present to mock dependencies" error
+// 3. I get Invalid responose body while trying to fetch <url>: Premature close
+//    - regardless of the type of the body & the headers are formatted correctly.
+
 const interceptor = new BatchInterceptor({
   name: "my-interceptor",
   interceptors: [
@@ -32,24 +37,6 @@ const interceptor = new BatchInterceptor({
 
 interceptor.apply();
 
-// From ReadableStream<Uint8Array> to string: (because the interface says so)
-async function streamToString(stream?: ReadableStream<Uint8Array> | null) {
-  if (!stream) return "";
-  const reader = stream.getReader();
-  let result = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    // result += value.toString();
-    result += Buffer.from(value).toString("utf-8");
-    // result += new TextDecoder("utf-8").decode(value);
-    // console.log("result", result);
-    // console.log("value", value);
-  }
-  return result;
-}
-
 function getHeadersInit(headers: { [k: string]: string[] }): {
   [k: string]: string;
 } {
@@ -60,13 +47,34 @@ function getHeadersInit(headers: { [k: string]: string[] }): {
   return result;
 }
 
+// sadly couldn't use the function in the express integration
+function fromHeadersToKeploy(headers: Headers) {
+  const headersArr: { [key: string]: StrArr } = {};
+  // const headersArr: { [key: string]: string } = {};
+  headers.forEach((value: string, key: string) => {
+    headersArr[key] = { Value: [value] };
+    // headersArr[key] = { Value: value };
+  });
+  return headersArr;
+}
+
+function fromHeadersToHeadersInit(headers: Headers) {
+  const headersArr: { [key: string]: string } = {};
+  headers.forEach((value, key) => {
+    headersArr[key] = value;
+  });
+  return headersArr;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 interceptor.on("request", (request, requestId) => {
   if (
     getExecutionContext() == undefined ||
     getExecutionContext().context == undefined
   ) {
-    console.error("keploy context is not present to mock dependencies");
+    console.error(
+      "keploy context [httpInterceptor-request] is not present to mock dependencies"
+    );
     return;
   }
   const ctx = getExecutionContext().context;
@@ -108,19 +116,29 @@ interceptor.on("request", (request, requestId) => {
       } else {
         ProcessDep({}, outputs);
       }
-      const rinit: ResponseInit = {};
 
-      rinit.headers = new Headers(outputs[1].headers);
-      rinit.status = outputs[1].status;
-      rinit.statusText = outputs[1].statusText;
       const buf: Buffer[] = [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       outputs[0].map((el: any) => {
         buf.push(Buffer.from(el));
       });
-      // const resp = new Response(Readable.from(buf), rinit);
 
-      // This doesnt work, problem with rinit.headers
-      const resp = new Response(Buffer.concat(buf), rinit);
+      const bodyInit = Buffer.concat(buf);
+
+      const formattedHeaders: { [key: string]: string } = {};
+      for (const key in outputs[1].headers) {
+        formattedHeaders[key] = outputs[1].headers[key];
+      }
+
+      const responseInit: ResponseInit = {
+        // or new Headers(formattedHeaders), all is accepted by NodeJS Response
+        headers: formattedHeaders,
+        status: outputs[1].status,
+        statusText: outputs[1].statusText,
+      };
+      // console.log("formattedHeaders", responseInit.headers);
+
+      const resp = new Response(bodyInit, responseInit);
       request.respondWith(resp);
 
       // This is the only way I could get it to work.
@@ -130,12 +148,12 @@ interceptor.on("request", (request, requestId) => {
       //       firstName: "John",
       //       lastName: "Maverick",
       //     }),
-      // {
-      // status: 201,
-      // statusText: "Created",
-      // headers: {
-      //   "Content-Type": "application/json",
-      // },
+      //     {
+      //       status: 201,
+      //       statusText: "Created",
+      //       headers: {
+      //         "Content-Type": "application/json",
+      //       },
       //     }
       //   )
       // );
@@ -157,9 +175,12 @@ interceptor.on("response", async (response, request) => {
     getExecutionContext() == undefined ||
     getExecutionContext().context == undefined
   ) {
-    console.error("keploy context is not present to mock dependencies");
+    console.log(
+      "keploy context [httpInterceptor-response] is not present to mock dependencies"
+    );
     return;
   }
+
   const ctx = getExecutionContext().context;
   console.log("ctx.mode at .on('response')", ctx.mode);
   // This means options that are in the function call itself,
@@ -182,40 +203,24 @@ interceptor.on("response", async (response, request) => {
   switch (ctx.mode) {
     case MODE_TEST:
       // This is dealt with on .on("request")
-      console.log("mocks get here too");
+      // When you use request.respondWith(), it will also get here.
       break;
     case MODE_RECORD:
       // Unsure if I need to clone
       const clonedResp = response.clone();
       const clonedReq = request.clone();
 
-      // This does not work, even breaks the code
-      // const json = await clonedResp.json();
-      // console.log("json", json);
+      // Using .json() => Unexpected token in JSON at position 0
+      const reqBody = await clonedReq.text();
+      const resBody = await clonedResp.text();
 
-      // const reqBody = await request.clone().json();
-      const reqBody = await streamToString(clonedReq.body);
-      const resBody = await streamToString(clonedResp.body);
+      // console.log("reqBody", reqBody);
+      // console.log("resBody", resBody);
 
-      console.log("reqBody", reqBody);
-      console.log("resBody", resBody);
-
-      // maybe try this later...
-      // const test = JSON.parse(JSON.stringify(clonedReq));
-
-      // sadly couldn't use the function in the express integration
-      const resHeadersArr = {} as { [key: string]: StrArr };
-      clonedResp.headers.forEach((value, key) => {
-        resHeadersArr[key] = { Value: [value] };
-      });
-
-      const reqHeadersArr = {} as { [key: string]: StrArr };
-      clonedReq.headers.forEach((value, key) => {
-        reqHeadersArr[key] = { Value: [value] };
-      });
-
-      const rinit = {
-        headers: resHeadersArr,
+      // to-do: What's the type of this?
+      const rinit: ResponseInit = {
+        // #test
+        headers: fromHeadersToHeadersInit(clonedResp.headers),
         status: clonedResp.status,
         statusText: clonedResp.statusText,
       };
@@ -228,17 +233,15 @@ interceptor.on("response", async (response, request) => {
           Metadata: meta,
           Req: {
             URL: request.url,
-            // Body: reqBody,
-            Body: "",
-            Header: reqHeadersArr,
+            Body: reqBody,
+            Header: fromHeadersToKeploy(request.headers),
             Method: request.method,
             // URLParams:
           },
           Res: {
             StatusCode: clonedResp.status,
-            Header: resHeadersArr,
-            // Body: resBody,
-            Body: "",
+            Header: getResponseHeader(rinit.headers),
+            Body: resBody,
           },
         },
       };
@@ -250,7 +253,7 @@ interceptor.on("response", async (response, request) => {
         // ProcessDep(meta, [respData, rinit]);
         const res: DataBytes[] = [];
         // for (let i = 0; i < outputs.length; i++) {
-        res.push({ Bin: stringToBinary(JSON.stringify("")) });
+        res.push({ Bin: stringToBinary(JSON.stringify(resBody)) });
         res.push({ Bin: stringToBinary(JSON.stringify(rinit)) });
         // }
         ctx.deps.push({
