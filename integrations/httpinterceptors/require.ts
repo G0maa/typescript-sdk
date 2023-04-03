@@ -21,7 +21,7 @@ import { getResponseHeader } from "../express/middleware";
 // This is a prototype for GSoC, "indirectly" recommended by Neha.
 // Generally I kept the original inegration from node-fetch
 // Stuck with:
-// 1. streamToString results in weird characters
+// 1. request.text() & response.text() results in weird characters
 // 2. I get "Keploy context is not present to mock dependencies" error
 // 3. I get Invalid responose body while trying to fetch <url>: Premature close
 //    - regardless of the type of the body & the headers are formatted correctly.
